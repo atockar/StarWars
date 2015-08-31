@@ -1,15 +1,15 @@
-import requests
-import re
+import requests, re, string
 from whoosh.index import create_in, open_dir
 from whoosh.fields import * 
 from whoosh.query import *
 from whoosh.qparser import QueryParser
 from whoosh import highlight
 import lists
-import textwrap
-import os
+import textwrap, os, math, numpy as np
 from collections import Counter
 from sklearn.cluster import KMeans
+import lda
+from stop_words import get_stop_words
 
 # Write index
 def write(path):
@@ -103,7 +103,7 @@ def charQuotes(ind):
 
 def outputSentiment(ind, path):
 	charFiles = os.listdir("Characters")
-	stanfordPath = 'C:\\Users\\Anthony\\Documents\\MSiA Notes\\4 Fall 14\\Text Analytics\\stanford-corenlp-full-2014-08-27'
+	stanfordPath = 'Text Analytics\\stanford-corenlp-full-2014-08-27'
 	for charFile in charFiles:
 		os.system("java -cp \"" + stanfordPath + "\\*\" -mx5g edu.stanford.nlp.sentiment.SentimentPipeline -file \"" + path + "\\Characters\\" + charFile +
 			"\" > \"" + path + "\\CharSent\\" + charFile +"\"")
@@ -124,13 +124,14 @@ def averageSentiment(path):
 		else:
 			return (sumSent / total)
 
+
 def charSentiment(ind, path):
 	# charQuotes(ind)
 	# outputSentiment(ind,path)
-	sentFiles = os.listdir("CharSent")
+	sentFiles = os.listdir(path + "\\CharSent")
 	chars = {}
 	for sentFile in sentFiles:
-		avgSent = averageSentiment("CharSent\\" + sentFile)
+		avgSent = averageSentiment(path + "\\CharSent\\" + sentFile)
 		chars[sentFile[:-4]] = avgSent
 	return chars
 
@@ -148,9 +149,9 @@ def clusterVars(ind, path):
 			obj["Name"] = character["Name"][0]
 			obj["NumQuotes"] = 0
 			for result in results:
-				obj["NumQuotes"] += len(result['quote'].split(' '))
+				obj["NumQuotes"] += len(result['quote'].split('\n'))
 			chars.append(obj)
-
+	
 	# Interest in Luke (Luke mentions), Force / Dark Side mentions
 	query1 = Or([Phrase("quote", ["red","five"]),Term("quote","luke"),Term("quote","skywalker")])
 	query2 = Or([Phrase("quote",["dark","side"]),Term("quote","force")])
@@ -168,6 +169,12 @@ def clusterVars(ind, path):
 				if result2['name'] == character["Name"].upper():
 					character["ForceMentions"] += 1
 
+	# Take proportions
+	for character in chars:
+		if character["NumQuotes"] > 0:
+			character["InterestInLuke"] = (character["InterestInLuke"] + 0.0) / character["NumQuotes"]
+			character["ForceMentions"] = (character["ForceMentions"] + 0.0) / character["NumQuotes"]
+
 	# Character sentiment average
 	charSents = charSentiment(ind, path)
 	for charSent in charSents:
@@ -177,24 +184,48 @@ def clusterVars(ind, path):
 
 	return chars
 
-# Transform cluster variables into an array
+# Transform cluster variables into an array and normalise
 def toArray(data):
 	arr = []
+
+	# Find mins and max's for min-max normalisation
+	minArr = [data[0]["NumQuotes"],data[0]["InterestInLuke"],data[0]["ForceMentions"],data[0]["Sentiment"]]
+	maxArr = [data[0]["NumQuotes"],data[0]["InterestInLuke"],data[0]["ForceMentions"],data[0]["Sentiment"]]
+
 	for character in data:
-		name = character["Name"]
-		numQuotes = character["NumQuotes"]
-		lukeInterest = character["InterestInLuke"]
-		forceMentions = character["ForceMentions"]
-		sentiment = character["Sentiment"]
+		if character["NumQuotes"] < minArr[0]:
+			minArr[0] = character["NumQuotes"]
+		if character["NumQuotes"] > maxArr[0]:
+			maxArr[0] = character["NumQuotes"]
+		if character["InterestInLuke"] < minArr[1]:
+			minArr[1] = character["InterestInLuke"]
+		if character["InterestInLuke"] > maxArr[1]:
+			maxArr[1] = character["InterestInLuke"] 
+		if character["ForceMentions"] < minArr[2]:
+			minArr[2] = character["ForceMentions"]
+		if character["ForceMentions"] > maxArr[2]:
+			maxArr[2] = character["ForceMentions"]
+		if character["Sentiment"] < minArr[3]:
+			minArr[3] = character["Sentiment"]
+		if character["Sentiment"] > maxArr[3]:
+			maxArr[3] = character["Sentiment"]
+
+	for character in data:
+		numQuotes = (character["NumQuotes"] - minArr[0]) / (maxArr[0]-minArr[0])
+		lukeInterest = (character["InterestInLuke"] - minArr[1]) / (maxArr[1]-minArr[1])
+		forceMentions = (character["ForceMentions"] - minArr[2]) / (maxArr[2]-minArr[2])
+		sentiment = (character["Sentiment"] - minArr[3]) / (maxArr[3]-minArr[3])
 		arr.append([numQuotes,lukeInterest,forceMentions,sentiment])
+
 	return arr
 
-def kmeans(data):
+
+def kmeans(data, clusters=5):
 	xData = toArray(data)
-	clust = KMeans(n_clusters=3)
+	clust = KMeans(n_clusters=clusters)
 	clust.fit(xData)
 
-	print(data)
+	# print(data)
 	print(clust.cluster_centers_)
 
 	# Output in a table, with heading cluster number and names below
@@ -208,17 +239,70 @@ def kmeans(data):
 	for c in allocate:
 		print(c + ": " + allocate[c])
 
-# Search index
-def search(path):
+
+# Create term-document matrix
+def termDoc(ind):
+
+	# Crawl index to find all terms
+	terms = set()
+	nameParser = QueryParser("name", schema=ind.schema)
+	stopwords = get_stop_words('en')
+	for character in lists.characters:
+		query = nameParser.parse(character["Name"][0])
+		with ind.searcher() as searcher:
+			results = searcher.search(query, limit=None)
+			for result in results:
+				tokens = result['quote'].split(' ')
+				for token in tokens:
+					term = token.strip(string.punctuation).lower()
+					if term not in stopwords:
+						terms.add(term)
+
+	# Crawl again to assign to term-document matrix
+	docs = ind.doc_count()
+	TD = np.zeros((docs,len(terms)), dtype=int)
+	termsArr = list(terms)
+
+	for character in lists.characters:
+		query = nameParser.parse(character["Name"][0])
+		with ind.searcher() as searcher:
+			results = searcher.search(query, limit=None)
+			for doc, result in enumerate(results):
+				tokens = result['quote'].split(' ')
+				for token in tokens:
+					term = token.strip(string.punctuation).lower()
+					try:
+						termIndex = termsArr.index(term)
+					except:
+						continue
+					TD[doc, termIndex] += 1
+
+	return (TD, termsArr)
+
+# LDA
+def topics(ind, num_topics=20, num_top_words=10):
+	TD, terms = termDoc(ind)
+	model = lda.LDA(n_topics=numtopics, n_iter=1000, random_state=1)
+	model.fit(TD)
+	topic_word = model.topic_word_
+	n_top_words = num_top_words
+	for i, topic_dist in enumerate(topic_word):
+		topic_words = np.array(terms)[np.argsort(topic_dist)][:-n_top_words:-1]
+		print('Topic {}: {}'.format(i, ' '.join(topic_words)))
+
+# Run some analysis
+def run(path):
 	ix = open_dir(path + "\\Index")
 	# print(ix.doc_count())
 
-	# affiliations(ix)
+	affiliations(ix)
 	counts(ix)
 	clusterVariables = clusterVars(ix, path)
 	kmeans(clusterVariables)
 
+	topics(ix)
+
 if __name__ == "__main__":
-	path = "C:\\Users\\Anthony\\Documents\\MSiA Notes\\4 Fall 14\\Text Analytics\\Assignments\\7 starwars"
-	# write(path)
-	search(path)
+	path = "\\7 starwars"
+	write(path)
+	run(path)
